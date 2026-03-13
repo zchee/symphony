@@ -18,19 +18,19 @@ The current milestone is bootstrap plus the first real runtime slices:
 - orchestrator state/coordination with dispatch, reconciliation, retry timing, worker-host-aware snapshots, per-host SSH worker caps, and Codex update aggregation
 - shared observability presenter plus JSON/HTTP API surface over worker-aware orchestrator snapshots
 - agent runner tying workspace, prompt, tracker refresh, Codex turns, worker-host fallback, and runtime metadata reporting together
-- first live service/runtime wiring in `internal/app` and `internal/cli.RuntimeDependencies()`
-- first terminal dashboard formatter in `internal/dashboard` backed by the checked-in fixture evidence
+- first live service/runtime wiring in `app` and `cli.RuntimeDependencies()`
+- first terminal dashboard formatter in `dashboard` backed by the checked-in fixture evidence
 - richer Codex telemetry and dashboard humanization, including turn lifecycle events, long-line buffering, stderr/non-JSON capture, and broader human-readable Codex status text
 - live Codex-owned `session_started`, `startup_failed`, and `turn_ended_with_error` lifecycle emission, plus basic Codex lifecycle and non-JSON stream logging
-- broader runtime lifecycle logging in `internal/agent` and `internal/app` for agent start/completion/failure, dispatch, retry, worker exit, and non-active issue transitions
-- stamp-based workflow cache and last-known-good reload retention in `internal/workflow`, now used by `internal/config` and `internal/prompt`
-- broader smoke coverage for the live service path in `internal/app`, including the real agent loop, fake Codex transport, and HTTP observability surface
-- richer HTML dashboard rendering in `internal/httpui` with CSS, metric cards, running/retry tables, JSON detail links, refresh affordance, and unavailable-state handling
-- background workflow polling support in `internal/workflow`, now started by the live runtime for closer parity with Elixir’s 1-second workflow-store refresh model
+- broader runtime lifecycle logging in `agent` and `app` for agent start/completion/failure, dispatch, retry, worker exit, and non-active issue transitions
+- stamp-based workflow cache and last-known-good reload retention in `workflow`, now used by `config` and `prompt`
+- broader smoke coverage for the live service path in `app`, including the real agent loop, fake Codex transport, and HTTP observability surface
+- richer HTML dashboard rendering in `httpui` with CSS, metric cards, running/retry tables, JSON detail links, refresh affordance, and unavailable-state handling
+- background workflow polling support in `workflow`, now started by the live runtime for closer parity with Elixir’s 1-second workflow-store refresh model
 - Go replacement for the `workspace.before_remove` helper via `symphony workspace-before-remove`
-- shared local-path canonicalization in `internal/pathsafety` and SSH transport helpers in `internal/ssh`
+- shared local-path canonicalization in `pathsafety` and SSH transport helpers in `ssh`
 - direct tests for SSH target parsing, remote workspace lifecycle, remote Codex launch, worker-host selection, worker-aware observability payloads, and Linear by-id pagination
-- an opt-in Go live-E2E harness in `internal/agent/live_e2e_test.go` plus `make e2e` for real Linear/Codex validation when credentials are available
+- an opt-in Go live-E2E harness in `agent/live_e2e_test.go` plus `make e2e` for real Linear/Codex validation when credentials are available
 
 The Go port has now been validated against the repo-owned workflow with real Linear auth for the startup/polling/HTTP surface. The main remaining work is documenting the few intentional or environment-shaped deviations that remain.
 

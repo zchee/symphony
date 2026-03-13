@@ -43,7 +43,7 @@ Use these labels consistently:
 | --- | --- | --- |
 | In-memory tracker test adapter | `elixir/lib/symphony_elixir/tracker/memory.ex` | Needed for deterministic Go tests without hitting Linear. |
 | Observability pubsub helper | `elixir/lib/symphony_elixir_web/observability_pubsub.ex` | Useful implementation pattern for change fanout, but not a required API on its own. |
-| Mix task for workspace cleanup | `elixir/lib/mix/tasks/workspace.before_remove.ex`, `elixir/test/mix/tasks/workspace_before_remove_test.exs` | Landed: `go/internal/workspacecleanup` plus `symphony workspace-before-remove` in the Go CLI now preserve the helper behavior with a Go command surface. |
+| Mix task for workspace cleanup | `elixir/lib/mix/tasks/workspace.before_remove.ex`, `elixir/test/mix/tasks/workspace_before_remove_test.exs` | Landed: `go/workspacecleanup` plus `symphony workspace-before-remove` in the Go CLI now preserve the helper behavior with a Go command surface. |
 | Repo hygiene tasks | `elixir/lib/mix/tasks/specs.check.ex`, `elixir/lib/mix/tasks/pr_body.check.ex`, `elixir/test/mix/tasks/*.exs` | Important for repo quality, though not part of the running Symphony daemon. |
 
 ## intentionally-deferred
@@ -66,9 +66,9 @@ Port these Elixir tests first because they lock down behavior that is both high-
 As the Go port advances, mark each row in this ledger with concrete implementation evidence such as package paths, test names, or documented deviations.
 
 Current evidence worth preserving:
-- `go/internal/ssh/ssh_test.go` covers host parsing, SSH config forwarding, IPv6 handling, and remote shell escaping.
-- `go/internal/workspace/workspace_test.go` covers local canonical-path behavior plus SSH-backed remote workspace lifecycle hooks and deletion.
-- `go/internal/codex/app_server_test.go` covers remote Codex launch over SSH and worker-aware sandbox/cwd payloads.
-- `go/internal/orchestrator/orchestrator_test.go` covers per-host worker-cap selection.
-- `go/internal/observability/presenter_test.go` covers worker-aware API payload fields.
-- `go/internal/linear/client_test.go` covers by-id pagination and requested-order preservation.
+- `go/ssh/ssh_test.go` covers host parsing, SSH config forwarding, IPv6 handling, and remote shell escaping.
+- `go/workspace/workspace_test.go` covers local canonical-path behavior plus SSH-backed remote workspace lifecycle hooks and deletion.
+- `go/codex/app_server_test.go` covers remote Codex launch over SSH and worker-aware sandbox/cwd payloads.
+- `go/orchestrator/orchestrator_test.go` covers per-host worker-cap selection.
+- `go/observability/presenter_test.go` covers worker-aware API payload fields.
+- `go/linear/client_test.go` covers by-id pagination and requested-order preservation.
