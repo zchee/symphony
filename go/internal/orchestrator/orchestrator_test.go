@@ -392,6 +392,50 @@ func TestApplyCodexUpdateTracksNestedRateLimitsAndPromptCompletionUsage(t *testi
 	}
 }
 
+func TestSelectWorkerHostHonorsPerHostCapacityAndPreferredHost(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "WORKFLOW.md")
+	workflowSource := `---
+tracker:
+  kind: "linear"
+  api_key: "token"
+  project_slug: "project"
+workspace:
+  root: "` + filepath.Join(dir, "workspaces") + `"
+agent:
+  max_concurrent_agents: 10
+worker:
+  ssh_hosts:
+    - "worker-a"
+    - "worker-b"
+  max_concurrent_agents_per_host: 1
+codex:
+  command: "codex app-server"
+---
+Prompt
+`
+	if err := os.WriteFile(path, []byte(workflowSource), 0o644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", path, err)
+	}
+	if err := runtimeconfig.SetWorkflowFilePath(path); err != nil {
+		t.Fatalf("runtimeconfig.SetWorkflowFilePath(%q) failed: %v", path, err)
+	}
+
+	state := NewState(time.Now())
+	state.Running["issue-1"] = RunningEntry{WorkerHost: "worker-a"}
+	if host, err := SelectWorkerHost(state, ""); err != nil || host != "worker-b" {
+		t.Fatalf("SelectWorkerHost() = %q, %v, want worker-b", host, err)
+	}
+	if host, err := SelectWorkerHost(state, "worker-b"); err != nil || host != "worker-b" {
+		t.Fatalf("SelectWorkerHost(preferred) = %q, %v, want worker-b", host, err)
+	}
+
+	state.Running["issue-2"] = RunningEntry{WorkerHost: "worker-b"}
+	if _, err := SelectWorkerHost(state, ""); !errors.Is(err, ErrNoWorkerCapacity) {
+		t.Fatalf("SelectWorkerHost(full) error = %v, want ErrNoWorkerCapacity", err)
+	}
+}
+
 func writeOrchestratorWorkflow(t *testing.T, overrides map[string]any) {
 	t.Helper()
 

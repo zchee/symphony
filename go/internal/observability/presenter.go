@@ -66,6 +66,8 @@ func StatePayload(source SnapshotSource, timeout time.Duration, now time.Time) m
 			"issue_id":         entry.IssueID,
 			"issue_identifier": entry.Identifier,
 			"state":            entry.State,
+			"worker_host":      emptyToNil(entry.WorkerHost),
+			"workspace_path":   entry.WorkspacePath,
 			"session_id":       entry.SessionID,
 			"turn_count":       entry.TurnCount,
 			"last_event":       entry.LastCodexEvent,
@@ -88,6 +90,8 @@ func StatePayload(source SnapshotSource, timeout time.Duration, now time.Time) m
 			"attempt":          entry.Attempt,
 			"due_at":           dueAtISO8601(now, entry.DueInMS),
 			"error":            entry.Error,
+			"worker_host":      emptyToNil(entry.WorkerHost),
+			"workspace_path":   entry.WorkspacePath,
 		})
 	}
 
@@ -155,7 +159,8 @@ func IssuePayload(issueIdentifier string, source SnapshotSource, timeout time.Du
 		"issue_id":         issueID,
 		"status":           status,
 		"workspace": map[string]any{
-			"path": filepath.Join(config.Current().WorkspaceRoot, issueIdentifier),
+			"path": workspacePath(issueIdentifier, running, retry),
+			"host": emptyToNil(workspaceHost(running, retry)),
 		},
 		"attempts": map[string]any{
 			"restart_count":         restartCount(retry),
@@ -173,13 +178,15 @@ func IssuePayload(issueIdentifier string, source SnapshotSource, timeout time.Du
 
 	if running != nil {
 		payload["running"] = map[string]any{
-			"session_id":    running.SessionID,
-			"turn_count":    running.TurnCount,
-			"state":         running.State,
-			"started_at":    iso8601(running.StartedAt),
-			"last_event":    running.LastCodexEvent,
-			"last_message":  summarizeMessage(running.LastCodexMessage),
-			"last_event_at": iso8601Ptr(running.LastCodexTimestamp),
+			"worker_host":    emptyToNil(running.WorkerHost),
+			"workspace_path": running.WorkspacePath,
+			"session_id":     running.SessionID,
+			"turn_count":     running.TurnCount,
+			"state":          running.State,
+			"started_at":     iso8601(running.StartedAt),
+			"last_event":     running.LastCodexEvent,
+			"last_message":   summarizeMessage(running.LastCodexMessage),
+			"last_event_at":  iso8601Ptr(running.LastCodexTimestamp),
 			"tokens": map[string]any{
 				"input_tokens":  running.CodexInputTokens,
 				"output_tokens": running.CodexOutputTokens,
@@ -199,9 +206,11 @@ func IssuePayload(issueIdentifier string, source SnapshotSource, timeout time.Du
 
 	if retry != nil {
 		payload["retry"] = map[string]any{
-			"attempt": retry.Attempt,
-			"due_at":  dueAtISO8601(now, retry.DueInMS),
-			"error":   retry.Error,
+			"attempt":        retry.Attempt,
+			"due_at":         dueAtISO8601(now, retry.DueInMS),
+			"error":          retry.Error,
+			"worker_host":    emptyToNil(retry.WorkerHost),
+			"workspace_path": retry.WorkspacePath,
 		}
 		payload["last_error"] = retry.Error
 	}
@@ -237,6 +246,33 @@ func retryAttempt(retry *orchestrator.RetrySnapshot) int {
 		return 0
 	}
 	return retry.Attempt
+}
+
+func workspacePath(issueIdentifier string, running *orchestrator.RunningSnapshot, retry *orchestrator.RetrySnapshot) string {
+	if running != nil && running.WorkspacePath != "" {
+		return running.WorkspacePath
+	}
+	if retry != nil && retry.WorkspacePath != "" {
+		return retry.WorkspacePath
+	}
+	return filepath.Join(config.Current().WorkspaceRoot, issueIdentifier)
+}
+
+func workspaceHost(running *orchestrator.RunningSnapshot, retry *orchestrator.RetrySnapshot) string {
+	if running != nil && running.WorkerHost != "" {
+		return running.WorkerHost
+	}
+	if retry != nil {
+		return retry.WorkerHost
+	}
+	return ""
+}
+
+func emptyToNil(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func dueAtISO8601(now time.Time, dueInMS int64) string {

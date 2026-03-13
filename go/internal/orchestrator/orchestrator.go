@@ -17,7 +17,10 @@ const (
 	failureRetryBaseMS       = int64(10_000)
 )
 
-var ErrWorkerNormal = errors.New("worker_normal")
+var (
+	ErrWorkerNormal     = errors.New("worker_normal")
+	ErrNoWorkerCapacity = errors.New("no_worker_capacity")
+)
 
 // TokenTotals tracks aggregate Codex token usage and runtime.
 type TokenTotals struct {
@@ -29,16 +32,20 @@ type TokenTotals struct {
 
 // RetryEntry describes one queued retry attempt.
 type RetryEntry struct {
-	Attempt    int
-	DueAtMS    int64
-	Identifier string
-	Error      string
+	Attempt       int
+	DueAtMS       int64
+	Identifier    string
+	Error         string
+	WorkerHost    string
+	WorkspacePath string
 }
 
 // RunningEntry is the active-runtime metadata for one claimed issue.
 type RunningEntry struct {
 	Identifier                    string
 	Issue                         domain.Issue
+	WorkerHost                    string
+	WorkspacePath                 string
 	SessionID                     string
 	CodexAppServerPID             string
 	LastCodexMessage              any
@@ -93,6 +100,8 @@ type RunningSnapshot struct {
 	IssueID            string
 	Identifier         string
 	State              string
+	WorkerHost         string
+	WorkspacePath      string
 	SessionID          string
 	CodexAppServerPID  string
 	CodexInputTokens   int
@@ -108,11 +117,13 @@ type RunningSnapshot struct {
 
 // RetrySnapshot is one retry-row projection.
 type RetrySnapshot struct {
-	IssueID    string
-	Attempt    int
-	DueInMS    int64
-	Identifier string
-	Error      string
+	IssueID       string
+	Attempt       int
+	DueInMS       int64
+	Identifier    string
+	Error         string
+	WorkerHost    string
+	WorkspacePath string
 }
 
 // PollingSnapshot contains the current poll status.
@@ -237,17 +248,21 @@ func HandleWorkerExit(state State, issueID string, reason error, now time.Time) 
 	if reason == nil || errors.Is(reason, ErrWorkerNormal) {
 		state.Completed[issueID] = struct{}{}
 		state = scheduleIssueRetry(state, issueID, 1, RetryEntry{
-			Attempt:    1,
-			Identifier: entry.Identifier,
+			Attempt:       1,
+			Identifier:    entry.Identifier,
+			WorkerHost:    entry.WorkerHost,
+			WorkspacePath: entry.WorkspacePath,
 		}, continuationRetryDelayMS, now)
 		return state
 	}
 
 	nextAttempt := nextRetryAttempt(entry)
 	state = scheduleIssueRetry(state, issueID, nextAttempt, RetryEntry{
-		Attempt:    nextAttempt,
-		Identifier: entry.Identifier,
-		Error:      "agent exited: " + reason.Error(),
+		Attempt:       nextAttempt,
+		Identifier:    entry.Identifier,
+		Error:         "agent exited: " + reason.Error(),
+		WorkerHost:    entry.WorkerHost,
+		WorkspacePath: entry.WorkspacePath,
 	}, backoffDelay(nextAttempt), now)
 	return state
 }
@@ -301,6 +316,8 @@ func SnapshotState(state State, now time.Time) Snapshot {
 			IssueID:            issueID,
 			Identifier:         entry.Identifier,
 			State:              entry.Issue.State,
+			WorkerHost:         entry.WorkerHost,
+			WorkspacePath:      entry.WorkspacePath,
 			SessionID:          entry.SessionID,
 			CodexAppServerPID:  entry.CodexAppServerPID,
 			CodexInputTokens:   entry.CodexInputTokens,
@@ -319,11 +336,13 @@ func SnapshotState(state State, now time.Time) Snapshot {
 	retrying := make([]RetrySnapshot, 0, len(state.RetryAttempts))
 	for issueID, retry := range state.RetryAttempts {
 		retrying = append(retrying, RetrySnapshot{
-			IssueID:    issueID,
-			Attempt:    retry.Attempt,
-			DueInMS:    max64(0, retry.DueAtMS-nowMS),
-			Identifier: retry.Identifier,
-			Error:      retry.Error,
+			IssueID:       issueID,
+			Attempt:       retry.Attempt,
+			DueInMS:       max64(0, retry.DueAtMS-nowMS),
+			Identifier:    retry.Identifier,
+			Error:         retry.Error,
+			WorkerHost:    retry.WorkerHost,
+			WorkspacePath: retry.WorkspacePath,
 		})
 	}
 	sort.SliceStable(retrying, func(i, j int) bool { return retrying[i].Identifier < retrying[j].Identifier })
@@ -418,6 +437,62 @@ func availableSlots(state State) int {
 	return remaining
 }
 
+// SelectWorkerHost chooses the remote worker host for the next dispatch. An empty host means local execution.
+func SelectWorkerHost(state State, preferredWorkerHost string) (string, error) {
+	hosts := config.Current().WorkerSSHHosts
+	if len(hosts) == 0 {
+		return "", nil
+	}
+
+	available := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if workerHostSlotsAvailable(state, host) {
+			available = append(available, host)
+		}
+	}
+	if len(available) == 0 {
+		return "", ErrNoWorkerCapacity
+	}
+
+	preferredWorkerHost = strings.TrimSpace(preferredWorkerHost)
+	if preferredWorkerHost != "" {
+		for _, host := range available {
+			if host == preferredWorkerHost {
+				return host, nil
+			}
+		}
+	}
+
+	selected := available[0]
+	selectedCount := runningWorkerHostCount(state.Running, selected)
+	for _, host := range available[1:] {
+		count := runningWorkerHostCount(state.Running, host)
+		if count < selectedCount {
+			selected = host
+			selectedCount = count
+		}
+	}
+	return selected, nil
+}
+
+func workerHostSlotsAvailable(state State, workerHost string) bool {
+	limit := config.Current().WorkerMaxConcurrentAgentsPerHost
+	if limit == nil || *limit <= 0 {
+		return true
+	}
+	return runningWorkerHostCount(state.Running, workerHost) < *limit
+}
+
+func runningWorkerHostCount(running map[string]RunningEntry, workerHost string) int {
+	count := 0
+	for _, entry := range running {
+		if entry.WorkerHost == workerHost {
+			count++
+		}
+	}
+	return count
+}
+
 func activeIssueState(state string, activeStates map[string]struct{}) bool {
 	_, ok := activeStates[normalizeIssueState(state)]
 	return ok
@@ -429,7 +504,7 @@ func terminalIssueState(state string, terminalStates map[string]struct{}) bool {
 }
 
 func normalizeIssueState(state string) string {
-	return strings.ToLower(strings.TrimSpace(state))
+	return strings.ToLower(state)
 }
 
 func activeStateSet() map[string]struct{} {

@@ -37,6 +37,12 @@ type workerUpdate struct {
 	update  orchestrator.CodexUpdate
 }
 
+type workerRuntime struct {
+	issueID       string
+	workerHost    string
+	workspacePath string
+}
+
 // Options configures the live service.
 type Options struct {
 	Tracker         tracker.Client
@@ -54,11 +60,12 @@ type Service struct {
 	snapshotTimeout time.Duration
 	now             func() time.Time
 
-	refreshCh    chan struct{}
-	workerDoneCh chan workerDone
-	workerUpCh   chan workerUpdate
-	stopCh       chan struct{}
-	doneCh       chan struct{}
+	refreshCh       chan struct{}
+	workerDoneCh    chan workerDone
+	workerUpCh      chan workerUpdate
+	workerRuntimeCh chan workerRuntime
+	stopCh          chan struct{}
+	doneCh          chan struct{}
 
 	httpServer   *http.Server
 	httpListener net.Listener
@@ -161,6 +168,7 @@ func Start(opts Options) (*Service, error) {
 		refreshCh:       make(chan struct{}, 1),
 		workerDoneCh:    make(chan workerDone, 32),
 		workerUpCh:      make(chan workerUpdate, 128),
+		workerRuntimeCh: make(chan workerRuntime, 32),
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
 	}
@@ -251,6 +259,15 @@ func (s *Service) loop() {
 		case update := <-s.workerUpCh:
 			s.mu.Lock()
 			s.state = orchestrator.ApplyCodexUpdate(s.state, update.issueID, update.update)
+			s.mu.Unlock()
+
+		case runtime := <-s.workerRuntimeCh:
+			s.mu.Lock()
+			if entry, ok := s.state.Running[runtime.issueID]; ok {
+				entry.WorkerHost = runtime.workerHost
+				entry.WorkspacePath = runtime.workspacePath
+				s.state.Running[runtime.issueID] = entry
+			}
 			s.mu.Unlock()
 
 		case done := <-s.workerDoneCh:
@@ -369,29 +386,53 @@ func (s *Service) dispatchIssues() {
 			}
 			continue
 		}
+		retryEntry, hasRetry := s.state.RetryAttempts[revalidated.ID]
+		preferredWorkerHost := ""
+		if hasRetry {
+			preferredWorkerHost = retryEntry.WorkerHost
+		}
+		workerHost, err := orchestrator.SelectWorkerHost(s.state, preferredWorkerHost)
+		if err != nil {
+			if errors.Is(err, orchestrator.ErrNoWorkerCapacity) {
+				continue
+			}
+			log.Printf("Skipping dispatch; worker selection failed for %s: %v", issueContext(revalidated), err)
+			continue
+		}
+
 		attempt := retryAttemptForIssue(s.state, revalidated.ID)
-		log.Printf("Dispatching issue to agent: %s attempt=%s", issueContext(revalidated), attemptString(attempt))
+		log.Printf("Dispatching issue to agent: %s attempt=%s worker_host=%s", issueContext(revalidated), attemptString(attempt), workerHostForLog(workerHost))
 
 		ctx, cancel := context.WithCancel(context.Background())
 		entry := orchestrator.RunningEntry{
-			Identifier: revalidated.Identifier,
-			Issue:      revalidated,
-			StartedAt:  now,
-			Stop:       cancel,
+			Identifier:    revalidated.Identifier,
+			Issue:         revalidated,
+			WorkerHost:    workerHost,
+			WorkspacePath: retryEntry.WorkspacePath,
+			StartedAt:     now,
+			Stop:          cancel,
 		}
 		s.state.Running[revalidated.ID] = entry
 		s.state.Claimed[revalidated.ID] = struct{}{}
 		delete(s.state.RetryAttempts, revalidated.ID)
 
-		go s.runAgent(ctx, revalidated)
+		go s.runAgent(ctx, revalidated, workerHost)
 	}
 }
 
-func (s *Service) runAgent(ctx context.Context, issue domain.Issue) {
+func (s *Service) runAgent(ctx context.Context, issue domain.Issue, workerHost string) {
 	var lastSessionID string
 	err := s.agentRun(ctx, issue, agent.Options{
 		Context:           ctx,
 		IssueStateFetcher: s.tracker.FetchIssueStatesByIDs,
+		WorkerHost:        workerHost,
+		OnRuntimeInfo: func(runtime map[string]any) {
+			s.workerRuntimeCh <- workerRuntime{
+				issueID:       issue.ID,
+				workerHost:    stringValue(runtime["worker_host"]),
+				workspacePath: stringValue(runtime["workspace_path"]),
+			}
+		},
 		OnCodexUpdate: func(update map[string]any) {
 			if sessionID := stringValue(update["session_id"]); strings.TrimSpace(sessionID) != "" {
 				lastSessionID = sessionID
@@ -512,7 +553,7 @@ func issueRoutableToWorker(issue domain.Issue) bool {
 }
 
 func normalizeIssueState(state string) string {
-	return strings.ToLower(strings.TrimSpace(state))
+	return strings.ToLower(state)
 }
 
 func issueContext(issue domain.Issue) string {
@@ -541,6 +582,13 @@ func workerReason(err error) string {
 		return "nil"
 	}
 	return err.Error()
+}
+
+func workerHostForLog(workerHost string) string {
+	if strings.TrimSpace(workerHost) == "" {
+		return "local"
+	}
+	return workerHost
 }
 
 func retryAttemptForIssue(state orchestrator.State, issueID string) int {

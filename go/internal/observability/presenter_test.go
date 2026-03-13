@@ -2,7 +2,6 @@ package observability
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -39,10 +38,13 @@ func TestStatePayload(t *testing.T) {
 	snapshot := orchestrator.Snapshot{
 		Running: []orchestrator.RunningSnapshot{
 			{
-				IssueID:           "issue-http",
-				Identifier:        "MT-HTTP",
-				State:             "In Progress",
-				SessionID:         "thread-http",
+				IssueID:       "issue-http",
+				Identifier:    "MT-HTTP",
+				State:         "In Progress",
+				WorkerHost:    "worker-a",
+				WorkspacePath: "/remote/workspaces/MT-HTTP",
+				SessionID:     "thread-http",
+
 				TurnCount:         7,
 				LastCodexEvent:    "notification",
 				LastCodexMessage:  "rendered",
@@ -54,11 +56,13 @@ func TestStatePayload(t *testing.T) {
 		},
 		Retrying: []orchestrator.RetrySnapshot{
 			{
-				IssueID:    "issue-retry",
-				Identifier: "MT-RETRY",
-				Attempt:    2,
-				DueInMS:    2_000,
-				Error:      "boom",
+				IssueID:       "issue-retry",
+				Identifier:    "MT-RETRY",
+				Attempt:       2,
+				DueInMS:       2_000,
+				Error:         "boom",
+				WorkerHost:    "worker-b",
+				WorkspacePath: "/remote/workspaces/MT-RETRY",
 			},
 		},
 		CodexTotals: orchestrator.TokenTotals{InputTokens: 4, OutputTokens: 8, TotalTokens: 12, SecondsRunning: 42},
@@ -74,9 +78,15 @@ func TestStatePayload(t *testing.T) {
 	if len(running) != 1 || running[0]["issue_identifier"] != "MT-HTTP" || running[0]["last_message"] != "rendered" {
 		t.Fatalf("running = %#v, want MT-HTTP rendered row", running)
 	}
+	if running[0]["worker_host"] != "worker-a" || running[0]["workspace_path"] != "/remote/workspaces/MT-HTTP" {
+		t.Fatalf("running worker metadata = %#v, want worker-a and remote workspace path", running[0])
+	}
 	retrying := payload["retrying"].([]map[string]any)
 	if len(retrying) != 1 || retrying[0]["issue_identifier"] != "MT-RETRY" {
 		t.Fatalf("retrying = %#v, want MT-RETRY row", retrying)
+	}
+	if retrying[0]["worker_host"] != "worker-b" || retrying[0]["workspace_path"] != "/remote/workspaces/MT-RETRY" {
+		t.Fatalf("retrying worker metadata = %#v, want worker-b and remote workspace path", retrying[0])
 	}
 }
 
@@ -100,10 +110,13 @@ func TestIssuePayload(t *testing.T) {
 	snapshot := orchestrator.Snapshot{
 		Running: []orchestrator.RunningSnapshot{
 			{
-				IssueID:            "issue-http",
-				Identifier:         "MT-HTTP",
-				State:              "In Progress",
-				SessionID:          "thread-http",
+				IssueID:       "issue-http",
+				Identifier:    "MT-HTTP",
+				State:         "In Progress",
+				WorkerHost:    "worker-a",
+				WorkspacePath: "/remote/workspaces/MT-HTTP",
+				SessionID:     "thread-http",
+
 				TurnCount:          7,
 				LastCodexEvent:     "notification",
 				LastCodexMessage:   "rendered",
@@ -123,9 +136,10 @@ func TestIssuePayload(t *testing.T) {
 	if payload["status"] != "running" || payload["issue_id"] != "issue-http" {
 		t.Fatalf("payload = %#v, want running issue payload", payload)
 	}
-	workspacePath := payload["workspace"].(map[string]any)["path"].(string)
-	if filepath.Base(workspacePath) != "MT-HTTP" {
-		t.Fatalf("workspace path = %q, want basename MT-HTTP", workspacePath)
+	workspace := payload["workspace"].(map[string]any)
+	workspacePath := workspace["path"].(string)
+	if workspacePath != "/remote/workspaces/MT-HTTP" || workspace["host"] != "worker-a" {
+		t.Fatalf("workspace payload = %#v, want remote path and worker-a host", workspace)
 	}
 	if payload["last_error"] != nil {
 		t.Fatalf("last_error = %#v, want nil", payload["last_error"])
