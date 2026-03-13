@@ -18,7 +18,8 @@ Use these labels consistently:
 | Typed config defaults and validation | `elixir/lib/symphony_elixir/config.ex` | Dispatch and Codex runtime settings depend on normalized typed values. |
 | Prompt rendering | `elixir/lib/symphony_elixir/prompt_builder.ex` | Every agent turn depends on strict issue-driven prompt construction. |
 | Linear issue normalization and pagination | `elixir/lib/symphony_elixir/linear/client.ex`, `elixir/lib/symphony_elixir/linear/issue.ex`, `elixir/lib/symphony_elixir/linear/adapter.ex` | Polling, reconciliation, blockers, and routing all depend on normalized issue data. |
-| Workspace safety and hooks | `elixir/lib/symphony_elixir/workspace.ex` | Prevents workspace escapes and controls lifecycle scripts. |
+| Workspace safety and hooks | `elixir/lib/symphony_elixir/workspace.ex`, `elixir/lib/symphony_elixir/path_safety.ex` | Prevents workspace escapes and controls lifecycle scripts for both local and remote workers. |
+| SSH worker execution | `elixir/lib/symphony_elixir/ssh.ex`, `elixir/lib/symphony_elixir/agent_runner.ex`, `elixir/lib/symphony_elixir/orchestrator.ex`, `elixir/lib/symphony_elixir/codex/app_server.ex` | Remote workers are part of the current implementation surface, including per-host caps, remote workspace handling, and SSH-backed Codex startup. |
 | Codex app-server protocol handling | `elixir/lib/symphony_elixir/codex/app_server.ex` | Symphony is fundamentally a Codex session orchestrator. |
 | Dynamic tool transport | `elixir/lib/symphony_elixir/codex/dynamic_tool.ex` | Existing workflows rely on `linear_graphql` during unattended runs. |
 | Agent execution loop | `elixir/lib/symphony_elixir/agent_runner.ex` | Bridges workspace, prompt, Codex turns, and issue refresh. |
@@ -63,3 +64,11 @@ Port these Elixir tests first because they lock down behavior that is both high-
 - `elixir/test/symphony_elixir/status_dashboard_snapshot_test.exs`
 
 As the Go port advances, mark each row in this ledger with concrete implementation evidence such as package paths, test names, or documented deviations.
+
+Current evidence worth preserving:
+- `go/internal/ssh/ssh_test.go` covers host parsing, SSH config forwarding, IPv6 handling, and remote shell escaping.
+- `go/internal/workspace/workspace_test.go` covers local canonical-path behavior plus SSH-backed remote workspace lifecycle hooks and deletion.
+- `go/internal/codex/app_server_test.go` covers remote Codex launch over SSH and worker-aware sandbox/cwd payloads.
+- `go/internal/orchestrator/orchestrator_test.go` covers per-host worker-cap selection.
+- `go/internal/observability/presenter_test.go` covers worker-aware API payload fields.
+- `go/internal/linear/client_test.go` covers by-id pagination and requested-order preservation.
