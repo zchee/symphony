@@ -94,7 +94,7 @@ func (c *Client) emit(event Event) {
 }
 
 func normalizeState(state string) string {
-	return strings.ToLower(strings.TrimSpace(state))
+	return strings.ToLower(state)
 }
 
 func cloneIssues(issues []domain.Issue) []domain.Issue {

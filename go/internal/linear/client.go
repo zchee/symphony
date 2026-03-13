@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -233,16 +234,41 @@ func (c *Client) FetchIssueStatesByIDs(issueIDs []string) ([]domain.Issue, error
 		return nil, err
 	}
 
-	body, err := c.graphql(issuesByIDQuery, map[string]any{
-		"ids":           ids,
-		"first":         min(len(ids), issuePageSize),
-		"relationFirst": issuePageSize,
-	}, "")
-	if err != nil {
-		return nil, err
+	issueOrder := make(map[string]int, len(ids))
+	for index, issueID := range ids {
+		issueOrder[issueID] = index
 	}
 
-	return decodeLinearResponse(body, assigneeFilter)
+	issues := make([]domain.Issue, 0, len(ids))
+	for start := 0; start < len(ids); start += issuePageSize {
+		end := start + issuePageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+
+		batch := ids[start:end]
+		body, err := c.graphql(issuesByIDQuery, map[string]any{
+			"ids":           batch,
+			"first":         len(batch),
+			"relationFirst": issuePageSize,
+		}, "")
+		if err != nil {
+			return nil, err
+		}
+
+		decoded, err := decodeLinearResponse(body, assigneeFilter)
+		if err != nil {
+			return nil, err
+		}
+		issues = append(issues, decoded...)
+	}
+
+	sort.SliceStable(issues, func(i, j int) bool {
+		left := issueOrder[issues[i].ID]
+		right := issueOrder[issues[j].ID]
+		return left < right
+	})
+	return issues, nil
 }
 
 // CreateComment creates a Linear comment for one issue.

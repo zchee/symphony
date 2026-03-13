@@ -121,6 +121,61 @@ func TestFetchIssuesByStatesEmptyReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestFetchIssueStatesByIDsPaginatesAndPreservesRequestedOrder(t *testing.T) {
+	ids := make([]string, 0, issuePageSize+2)
+	for index := 1; index <= issuePageSize+2; index++ {
+		ids = append(ids, fmt.Sprintf("issue-%d", index))
+	}
+	callCount := 0
+	client := &Client{Request: func(_ string, payload map[string]any, _ map[string]string) (Response, error) {
+		callCount++
+		variables, _ := payload["variables"].(map[string]any)
+		var batch []string
+		switch typed := variables["ids"].(type) {
+		case []string:
+			batch = append(batch, typed...)
+		case []any:
+			for _, raw := range typed {
+				batch = append(batch, raw.(string))
+			}
+		}
+		nodes := make([]any, 0, len(batch))
+		for index := len(batch) - 1; index >= 0; index-- {
+			issueID := batch[index]
+			nodes = append(nodes, map[string]any{
+				"id":         issueID,
+				"identifier": strings.ToUpper(strings.ReplaceAll(issueID, "issue-", "mt-")),
+				"title":      issueID,
+				"state":      map[string]any{"name": "Todo"},
+			})
+		}
+		return Response{Status: 200, Body: map[string]any{"data": map[string]any{"issues": map[string]any{"nodes": nodes}}}}, nil
+	}}
+	writeLinearWorkflow(t, map[string]any{
+		"tracker": map[string]any{
+			"kind":         "linear",
+			"api_key":      "token",
+			"project_slug": "project",
+		},
+	})
+
+	issues, err := client.FetchIssueStatesByIDs(ids)
+	if err != nil {
+		t.Fatalf("FetchIssueStatesByIDs() returned error: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("FetchIssueStatesByIDs() callCount = %d, want 2", callCount)
+	}
+	if len(issues) != len(ids) {
+		t.Fatalf("len(issues) = %d, want %d", len(issues), len(ids))
+	}
+	for index, issue := range issues {
+		if issue.ID != ids[index] {
+			t.Fatalf("issues[%d].ID = %q, want %q", index, issue.ID, ids[index])
+		}
+	}
+}
+
 func TestPaginationMergePreservesIssueOrdering(t *testing.T) {
 	merged := []domain.Issue{}
 	merged = append(merged, []domain.Issue{{ID: "issue-1", Identifier: "MT-1"}, {ID: "issue-2", Identifier: "MT-2"}}...)

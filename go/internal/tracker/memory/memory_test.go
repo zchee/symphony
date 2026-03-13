@@ -24,7 +24,7 @@ func TestFetchCandidateIssuesPreservesConfiguredOrder(t *testing.T) {
 	}
 }
 
-func TestFetchIssuesByStatesNormalizesStateNames(t *testing.T) {
+func TestFetchIssuesByStatesLowercasesWithoutTrimmingStateNames(t *testing.T) {
 	client := &Client{
 		Issues: []domain.Issue{
 			{ID: "1", Identifier: "MT-1", State: "Todo"},
@@ -38,8 +38,8 @@ func TestFetchIssuesByStatesNormalizesStateNames(t *testing.T) {
 		t.Fatalf("FetchIssuesByStates() returned error: %v", err)
 	}
 
-	if len(issues) != 2 || issues[0].Identifier != "MT-1" || issues[1].Identifier != "MT-2" {
-		t.Fatalf("FetchIssuesByStates() = %#v, want Todo and In Progress issues", issues)
+	if len(issues) != 1 || issues[0].Identifier != "MT-2" {
+		t.Fatalf("FetchIssuesByStates() = %#v, want only the exact lowercased IN PROGRESS match", issues)
 	}
 }
 
