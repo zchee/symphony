@@ -15,6 +15,8 @@ import (
 	"github.com/openai/symphony/go/internal/config"
 	"github.com/openai/symphony/go/internal/domain"
 	"github.com/openai/symphony/go/internal/linear"
+	"github.com/openai/symphony/go/internal/pathsafety"
+	"github.com/openai/symphony/go/internal/ssh"
 )
 
 const (
@@ -116,6 +118,7 @@ type Session struct {
 	TurnSandboxPolicy map[string]any
 	ThreadID          string
 	Workspace         string
+	WorkerHost        string
 	Metadata          map[string]any
 }
 
@@ -143,38 +146,37 @@ type MessageHandler func(map[string]any)
 type RunOptions struct {
 	OnMessage    MessageHandler
 	ToolExecutor ToolExecutor
+	WorkerHost   string
 }
 
 // Run starts a session, runs one turn, and always stops the session.
 func Run(workspace, prompt string, issue domain.Issue, opts ...RunOptions) (RunResult, error) {
-	session, err := StartSession(workspace)
+	runOpts := resolveRunOptions(opts...)
+	session, err := StartSessionWithHost(workspace, runOpts.WorkerHost)
 	if err != nil {
 		return RunResult{}, err
 	}
 	defer StopSession(session)
 
-	return RunTurn(session, prompt, issue, opts...)
+	return RunTurn(session, prompt, issue, runOpts)
 }
 
 // StartSession launches Codex, performs initialize/initialized/thread-start, and returns the live session.
 func StartSession(workspace string) (*Session, error) {
-	expandedWorkspace, err := filepath.Abs(workspace)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateWorkspaceCWD(expandedWorkspace); err != nil {
-		return nil, err
-	}
+	return StartSessionWithHost(workspace, "")
+}
 
-	cfg := config.Current()
-	bashPath, err := exec.LookPath("bash")
+// StartSessionWithHost launches Codex locally or over SSH, performs initialize/initialized/thread-start, and returns the live session.
+func StartSessionWithHost(workspace, workerHost string) (*Session, error) {
+	resolvedWorkspace, err := validateWorkspaceCWD(workspace, workerHost)
 	if err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(bashPath, "-lc", cfg.CodexCommand)
-	cmd.Dir = expandedWorkspace
-
+	cmd, metadata, runtimeSettings, err := startCommand(resolvedWorkspace, workerHost)
+	if err != nil {
+		return nil, err
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -190,18 +192,25 @@ func StartSession(workspace string) (*Session, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if cmd.Process != nil {
+		metadata["codex_app_server_pid"] = cmd.Process.Pid
+	}
 
 	session := &Session{
 		cmd:               cmd,
 		stdin:             stdin,
 		messages:          make(chan incomingMessage, 128),
 		waitErr:           make(chan error, 1),
-		ApprovalPolicy:    cfg.CodexApprovalPolicy,
-		AutoApprove:       approvalPolicyIsNever(cfg.CodexApprovalPolicy),
-		ThreadSandbox:     cfg.CodexThreadSandbox,
-		TurnSandboxPolicy: cfg.CodexTurnSandboxPolicy,
-		Workspace:         expandedWorkspace,
-		Metadata:          map[string]any{"codex_app_server_pid": cmd.Process.Pid},
+		ApprovalPolicy:    runtimeSettings.ApprovalPolicy,
+		AutoApprove:       approvalPolicyIsNever(runtimeSettings.ApprovalPolicy),
+		ThreadSandbox:     runtimeSettings.ThreadSandbox,
+		TurnSandboxPolicy: runtimeSettings.TurnSandboxPolicy,
+		Workspace:         resolvedWorkspace,
+		WorkerHost:        workerHost,
+		Metadata:          metadata,
 	}
 
 	go readStreamLines(stdout, "stdout", session.messages)
@@ -226,7 +235,7 @@ func StartSession(workspace string) (*Session, error) {
 	}); err != nil {
 		return nil, err
 	}
-	if _, err := session.awaitResponse(initializeID, time.Duration(cfg.CodexReadTimeoutMS)*time.Millisecond); err != nil {
+	if _, err := session.awaitResponse(initializeID, time.Duration(config.Current().CodexReadTimeoutMS)*time.Millisecond); err != nil {
 		return nil, err
 	}
 	if err := session.sendJSON(map[string]any{
@@ -247,6 +256,31 @@ func StartSession(workspace string) (*Session, error) {
 	session.ThreadID = threadID
 
 	return session, nil
+}
+
+func startCommand(workspace, workerHost string) (*exec.Cmd, map[string]any, config.CodexRuntimeSettings, error) {
+	runtimeSettings, err := config.RuntimeCodexSettings(workspace, workerHost != "")
+	if err != nil {
+		return nil, nil, config.CodexRuntimeSettings{}, err
+	}
+
+	if workerHost == "" {
+		bashPath, err := exec.LookPath("bash")
+		if err != nil {
+			return nil, nil, config.CodexRuntimeSettings{}, err
+		}
+
+		cmd := exec.Command(bashPath, "-lc", config.Current().CodexCommand)
+		cmd.Dir = workspace
+		return cmd, map[string]any{}, runtimeSettings, nil
+	}
+
+	cmd, err := ssh.StartCommand(workerHost, ssh.FormatRemoteChdirExec(workspace, config.Current().CodexCommand))
+	if err != nil {
+		return nil, nil, config.CodexRuntimeSettings{}, err
+	}
+
+	return cmd, map[string]any{"worker_host": workerHost}, runtimeSettings, nil
 }
 
 // StopSession closes the underlying process and pipes.
@@ -583,22 +617,52 @@ func (s *Session) sendJSON(payload map[string]any) error {
 	return err
 }
 
-func validateWorkspaceCWD(workspace string) error {
-	root, err := filepath.Abs(config.Current().WorkspaceRoot)
+func validateWorkspaceCWD(workspace, workerHost string) (string, error) {
+	if workerHost != "" {
+		switch {
+		case strings.TrimSpace(workspace) == "":
+			return "", &InvalidWorkspaceCwdError{Kind: "empty_remote_workspace", Path: workspace, Root: workerHost}
+		case strings.Contains(workspace, "\n"), strings.Contains(workspace, "\r"), strings.ContainsRune(workspace, rune(0)):
+			return "", &InvalidWorkspaceCwdError{Kind: "invalid_remote_workspace", Path: workspace, Root: workerHost}
+		default:
+			return workspace, nil
+		}
+	}
+
+	expandedWorkspace, err := filepath.Abs(workspace)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if workspace == root {
-		return &InvalidWorkspaceCwdError{Kind: "workspace_root", Path: workspace}
-	}
-	relative, err := filepath.Rel(root, workspace)
+	expandedRoot, err := filepath.Abs(config.LocalWorkspaceRoot())
 	if err != nil {
-		return err
+		return "", err
 	}
-	if relative == "." || relative == "" || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return &InvalidWorkspaceCwdError{Kind: "outside_workspace_root", Path: workspace, Root: root}
+
+	canonicalWorkspace, err := pathsafety.Canonicalize(expandedWorkspace)
+	if err != nil {
+		return "", &InvalidWorkspaceCwdError{Kind: "path_unreadable", Path: expandedWorkspace, Root: err.Error()}
 	}
-	return nil
+	canonicalRoot, err := pathsafety.Canonicalize(expandedRoot)
+	if err != nil {
+		return "", &InvalidWorkspaceCwdError{Kind: "path_unreadable", Path: expandedRoot, Root: err.Error()}
+	}
+
+	if canonicalWorkspace == canonicalRoot {
+		return "", &InvalidWorkspaceCwdError{Kind: "workspace_root", Path: canonicalWorkspace}
+	}
+	if relative, err := filepath.Rel(canonicalRoot, canonicalWorkspace); err == nil {
+		if relative != "." && relative != "" && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return canonicalWorkspace, nil
+		}
+	}
+
+	if relative, err := filepath.Rel(expandedRoot, expandedWorkspace); err == nil {
+		if relative != "." && relative != "" && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return "", &InvalidWorkspaceCwdError{Kind: "symlink_escape", Path: expandedWorkspace, Root: canonicalRoot}
+		}
+	}
+
+	return "", &InvalidWorkspaceCwdError{Kind: "outside_workspace_root", Path: canonicalWorkspace, Root: canonicalRoot}
 }
 
 func approvalPolicyIsNever(value any) bool {

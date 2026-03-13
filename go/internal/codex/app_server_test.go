@@ -820,6 +820,71 @@ done
 	t.Fatalf("events = %#v, want malformed stderr event", events)
 }
 
+func TestRunLaunchesOverSSHForRemoteWorkers(t *testing.T) {
+	testRoot := t.TempDir()
+	traceFile := filepath.Join(testRoot, "ssh.trace")
+	fakeSSH := filepath.Join(testRoot, "ssh")
+	previousPath := os.Getenv("PATH")
+	t.Setenv("PATH", testRoot+":"+previousPath)
+
+	writeExecutable(t, fakeSSH, `#!/bin/sh
+trace_file="`+traceFile+`"
+count=0
+printf 'ARGV:%s\n' "$*" >> "$trace_file"
+while IFS= read -r line; do
+  count=$((count + 1))
+  printf 'JSON:%s\n' "$line" >> "$trace_file"
+  case "$count" in
+    1) printf '%s\n' '{"id":1,"result":{}}' ;;
+    2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}' ;;
+    3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}' ;;
+    4) printf '%s\n' '{"method":"turn/completed"}'; exit 0 ;;
+    *) exit 0 ;;
+  esac
+done
+`)
+
+	remoteWorkspace := "/remote/workspaces/MT-REMOTE"
+	writeCodexWorkflow(t, "/remote/workspaces", map[string]any{
+		"codex": map[string]any{
+			"command": "fake-remote-codex app-server",
+		},
+	})
+
+	issue := domain.Issue{ID: "issue-remote", Identifier: "MT-REMOTE", Title: "Run remote app server", State: "In Progress"}
+	if _, err := Run(remoteWorkspace, "Run remote worker", issue, RunOptions{WorkerHost: "worker-01:2200"}); err != nil {
+		t.Fatalf("Run(remote ssh) returned error: %v", err)
+	}
+
+	trace := string(mustReadFile(t, traceFile))
+	lines := strings.Split(strings.TrimSpace(trace), "\n")
+	argvLine := ""
+	for _, line := range lines {
+		if strings.HasPrefix(line, "ARGV:") {
+			argvLine = line
+			break
+		}
+	}
+	if argvLine == "" {
+		t.Fatalf("trace missing ARGV line: %q", trace)
+	}
+	for _, fragment := range []string{"-T -p 2200 worker-01 bash -lc", remoteWorkspace, "fake-remote-codex app-server"} {
+		if !strings.Contains(argvLine, fragment) {
+			t.Fatalf("argv line missing %q: %q", fragment, argvLine)
+		}
+	}
+
+	assertTraceContainsJSON(t, lines, func(payload map[string]any) bool {
+		return intEquals(payload["id"], 2) && lookupString(payload, "params", "cwd") == remoteWorkspace
+	})
+	assertTraceContainsJSON(t, lines, func(payload map[string]any) bool {
+		params, _ := payload["params"].(map[string]any)
+		sandboxPolicy, _ := params["sandboxPolicy"].(map[string]any)
+		roots, _ := sandboxPolicy["writableRoots"].([]any)
+		return intEquals(payload["id"], 3) && lookupString(payload, "params", "cwd") == remoteWorkspace && len(roots) == 1 && roots[0] == remoteWorkspace
+	})
+}
+
 func writeCodexWorkflow(t *testing.T, workspaceRoot string, overrides map[string]any) {
 	t.Helper()
 

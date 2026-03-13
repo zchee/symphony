@@ -53,7 +53,9 @@ codex:
 tracker:
   kind: linear
   project_slug: project
-  active_states: "Todo,  Review,"
+  active_states:
+    - Todo
+    - Review
 agent:
   max_turns: 5
 codex:
@@ -185,6 +187,72 @@ tracker:
 	}
 }
 
+func TestRuntimeCodexSettingsResolvesLocalAndRemoteWorkspacePolicies(t *testing.T) {
+	writeWorkflowFile(t, `---
+tracker:
+  kind: linear
+  project_slug: project
+workspace:
+  root: "~/.symphony-workspaces"
+worker:
+  ssh_hosts:
+    - worker-01:2200
+  max_concurrent_agents_per_host: 2
+codex:
+  approval_policy: ""
+  thread_sandbox: ""
+---
+`)
+	t.Setenv("LINEAR_API_KEY", "env-token")
+
+	current := Current()
+	if got, want := current.WorkspaceRoot, "~/.symphony-workspaces"; got != want {
+		t.Fatalf("Current().WorkspaceRoot = %q, want %q", got, want)
+	}
+	if current.WorkerMaxConcurrentAgentsPerHost == nil || *current.WorkerMaxConcurrentAgentsPerHost != 2 {
+		t.Fatalf("Current().WorkerMaxConcurrentAgentsPerHost = %#v, want 2", current.WorkerMaxConcurrentAgentsPerHost)
+	}
+	if got, want := current.WorkerSSHHosts, []string{"worker-01:2200"}; !equalStrings(got, want) {
+		t.Fatalf("Current().WorkerSSHHosts = %#v, want %#v", got, want)
+	}
+
+	localSettings, err := RuntimeCodexSettings("", false)
+	if err != nil {
+		t.Fatalf("RuntimeCodexSettings(local) error = %v", err)
+	}
+	if localSettings.ApprovalPolicy != "" {
+		t.Fatalf("local approval policy = %#v, want blank string passthrough", localSettings.ApprovalPolicy)
+	}
+	if localSettings.ThreadSandbox != "" {
+		t.Fatalf("local thread sandbox = %q, want blank string passthrough", localSettings.ThreadSandbox)
+	}
+	writableRoots, ok := localSettings.TurnSandboxPolicy["writableRoots"].([]any)
+	if !ok || len(writableRoots) != 1 {
+		t.Fatalf("local writableRoots = %#v, want one local root", localSettings.TurnSandboxPolicy["writableRoots"])
+	}
+	if got := writableRoots[0]; got == current.WorkspaceRoot {
+		t.Fatalf("local writable root = %#v, want expanded local path instead of raw root %q", got, current.WorkspaceRoot)
+	}
+
+	remoteSettings, err := RuntimeCodexSettings("", true)
+	if err != nil {
+		t.Fatalf("RuntimeCodexSettings(remote) error = %v", err)
+	}
+	remoteRoots, ok := remoteSettings.TurnSandboxPolicy["writableRoots"].([]any)
+	if !ok || len(remoteRoots) != 1 || remoteRoots[0] != "~/.symphony-workspaces" {
+		t.Fatalf("remote writableRoots = %#v, want raw remote root", remoteSettings.TurnSandboxPolicy["writableRoots"])
+	}
+
+	issueRemoteSettings, err := RuntimeCodexSettings("/remote/workspaces/MT-100", true)
+	if err != nil {
+		t.Fatalf("RuntimeCodexSettings(remote workspace) error = %v", err)
+	}
+	issueRemoteRoots, _ := issueRemoteSettings.TurnSandboxPolicy["writableRoots"].([]any)
+	if len(issueRemoteRoots) != 1 || issueRemoteRoots[0] != "/remote/workspaces/MT-100" {
+		t.Fatalf("issue remote writableRoots = %#v, want issue workspace", issueRemoteRoots)
+	}
+}
+
 func TestValidateChecksTrackerAndCodexValues(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "env-token")
 
@@ -234,6 +302,29 @@ codex:
 	var invalidTurnPolicy *InvalidCodexTurnSandboxPolicyError
 	if err := Validate(); !errors.As(err, &invalidTurnPolicy) {
 		t.Fatalf("Validate() error = %v, want InvalidCodexTurnSandboxPolicyError", err)
+	}
+
+	writeWorkflowFile(t, `---
+tracker:
+  kind: linear
+  project_slug: project
+  active_states: "Todo,Review"
+---
+`)
+	if err := Validate(); err == nil || err.Error() != "tracker.active_states must be a YAML list of strings" {
+		t.Fatalf("Validate() error = %v, want tracker.active_states list validation error", err)
+	}
+
+	writeWorkflowFile(t, `---
+tracker:
+  kind: linear
+  project_slug: project
+worker:
+  max_concurrent_agents_per_host: 0
+---
+`)
+	if err := Validate(); err == nil || err.Error() != "worker.max_concurrent_agents_per_host must be a positive integer" {
+		t.Fatalf("Validate() error = %v, want worker.max_concurrent_agents_per_host validation error", err)
 	}
 
 	writeWorkflowFile(t, `---

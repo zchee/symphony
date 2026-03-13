@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openai/symphony/go/internal/pathsafety"
 	"github.com/openai/symphony/go/internal/runtimeconfig"
 )
 
@@ -102,9 +103,7 @@ func TestCreateForIssueReusesExistingDirectoryWithoutDeletingLocalChanges(t *tes
 	assertFileContents(t, filepath.Join(second, "local-progress.txt"), "in progress\n")
 	assertFileContents(t, filepath.Join(second, "deps", "cache.txt"), "cached deps\n")
 	assertFileContents(t, filepath.Join(second, "_build", "artifact.txt"), "compiled artifact\n")
-	if _, err := os.Stat(filepath.Join(second, "tmp", "scratch.txt")); !os.IsNotExist(err) {
-		t.Fatalf("tmp artifact still exists, err=%v", err)
-	}
+	assertFileContents(t, filepath.Join(second, "tmp", "scratch.txt"), "remove me\n")
 }
 
 func TestCreateForIssueReplacesStaleNonDirectoryPaths(t *testing.T) {
@@ -118,8 +117,12 @@ func TestCreateForIssueReplacesStaleNonDirectoryPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateForIssue() returned error: %v", err)
 	}
-	if workspace != staleWorkspace {
-		t.Fatalf("workspace = %q, want %q", workspace, staleWorkspace)
+	canonicalWorkspace, err := pathsafety.Canonicalize(staleWorkspace)
+	if err != nil {
+		t.Fatalf("pathsafety.Canonicalize(%q) failed: %v", staleWorkspace, err)
+	}
+	if workspace != canonicalWorkspace {
+		t.Fatalf("workspace = %q, want %q", workspace, canonicalWorkspace)
 	}
 	info, err := os.Stat(workspace)
 	if err != nil {
@@ -143,12 +146,20 @@ func TestCreateForIssueRejectsSymlinkEscapes(t *testing.T) {
 	writeWorkspaceWorkflow(t, workspaceRoot, nil)
 
 	_, err := CreateForIssue("MT-SYM")
-	var symlinkErr *WorkspaceSymlinkEscapeError
-	if !errors.As(err, &symlinkErr) {
-		t.Fatalf("CreateForIssue() error = %v, want WorkspaceSymlinkEscapeError", err)
+	var outsideErr *WorkspaceOutsideRootError
+	if !errors.As(err, &outsideErr) {
+		t.Fatalf("CreateForIssue() error = %v, want WorkspaceOutsideRootError", err)
 	}
-	if symlinkErr.Path != symlinkPath {
-		t.Fatalf("symlink path = %q, want %q", symlinkErr.Path, symlinkPath)
+	canonicalOutside, err := pathsafety.Canonicalize(outsideRoot)
+	if err != nil {
+		t.Fatalf("pathsafety.Canonicalize(%q) failed: %v", outsideRoot, err)
+	}
+	canonicalRoot, err := pathsafety.Canonicalize(workspaceRoot)
+	if err != nil {
+		t.Fatalf("pathsafety.Canonicalize(%q) failed: %v", workspaceRoot, err)
+	}
+	if outsideErr.Workspace != canonicalOutside || outsideErr.Root != canonicalRoot {
+		t.Fatalf("outside error = %#v, want workspace=%q root=%q", outsideErr, canonicalOutside, canonicalRoot)
 	}
 }
 
@@ -252,6 +263,64 @@ func TestRemoveIssueWorkspacesHandlesMissingRootAndNonStringIdentifier(t *testin
 	}
 }
 
+func TestRemoteWorkspaceLifecycleUsesSSHHostAliases(t *testing.T) {
+	testRoot := t.TempDir()
+	traceFile := filepath.Join(testRoot, "ssh.trace")
+	fakeSSH := filepath.Join(testRoot, "ssh")
+	previousPath := os.Getenv("PATH")
+	t.Setenv("PATH", testRoot+":"+previousPath)
+
+	if err := os.WriteFile(fakeSSH, []byte(`#!/bin/sh
+trace_file="`+traceFile+`"
+printf 'ARGV:%s\n' "$*" >> "$trace_file"
+case "$*" in
+  *"__SYMPHONY_WORKSPACE__"*)
+    printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-WS'
+    ;;
+esac
+exit 0
+`), 0o755); err != nil {
+		t.Fatalf("os.WriteFile(fake ssh) failed: %v", err)
+	}
+
+	writeWorkspaceWorkflow(t, "~/.symphony-remote-workspaces", map[string]any{
+		"hooks": map[string]any{
+			"before_run":    "echo before-run",
+			"after_run":     "echo after-run",
+			"before_remove": "echo before-remove",
+		},
+		"worker": map[string]any{
+			"ssh_hosts": []string{"worker-01:2200"},
+		},
+	})
+
+	workspacePath, err := CreateForIssueOnHost("MT-SSH-WS", "worker-01:2200")
+	if err != nil {
+		t.Fatalf("CreateForIssueOnHost() returned error: %v", err)
+	}
+	if got, want := workspacePath, "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"; got != want {
+		t.Fatalf("workspacePath = %q, want %q", got, want)
+	}
+	if err := RunBeforeRunHookOnHost(workspacePath, "worker-01:2200"); err != nil {
+		t.Fatalf("RunBeforeRunHookOnHost() returned error: %v", err)
+	}
+	RunAfterRunHookOnHost(workspacePath, "worker-01:2200")
+	if err := RemoveIssueWorkspacesOnHost("MT-SSH-WS", "worker-01:2200"); err != nil {
+		t.Fatalf("RemoveIssueWorkspacesOnHost() returned error: %v", err)
+	}
+
+	trace, err := os.ReadFile(traceFile)
+	if err != nil {
+		t.Fatalf("os.ReadFile(trace) failed: %v", err)
+	}
+	traceText := string(trace)
+	for _, fragment := range []string{"-T -p 2200 worker-01 bash -lc", "__SYMPHONY_WORKSPACE__", "~/.symphony-remote-workspaces/MT-SSH-WS", "${workspace#~/}", "echo before-run", "echo after-run", "echo before-remove", "rm -rf", workspacePath} {
+		if !strings.Contains(traceText, fragment) {
+			t.Fatalf("trace missing %q: %q", fragment, traceText)
+		}
+	}
+}
+
 func TestRemoveContinuesWhenBeforeRemoveHookFailsOrTimesOut(t *testing.T) {
 	workspaceRoot := filepath.Join(t.TempDir(), "workspaces")
 	writeWorkspaceWorkflow(t, workspaceRoot, map[string]any{
@@ -305,28 +374,43 @@ workspace:
 ---`
 
 	if overrides != nil {
+		lines := []string{
+			"---",
+			"tracker:",
+			`  kind: "linear"`,
+			`  api_key: "token"`,
+			`  project_slug: "project"`,
+			"workspace:",
+			`  root: "` + workspaceRoot + `"`,
+		}
 		if hooks, ok := overrides["hooks"].(map[string]any); ok {
-			lines := []string{
-				"---",
-				"tracker:",
-				`  kind: "linear"`,
-				`  api_key: "token"`,
-				`  project_slug: "project"`,
-				"workspace:",
-				`  root: "` + workspaceRoot + `"`,
-				"hooks:",
-			}
+			lines = append(lines, "hooks:")
 			if timeout, ok := hooks["timeout_ms"]; ok {
 				lines = append(lines, fmt.Sprintf("  timeout_ms: %v", timeout))
 			}
 			if afterCreate, ok := hooks["after_create"].(string); ok {
 				lines = append(lines, "  after_create: |", indentHook(afterCreate))
 			}
+			if beforeRun, ok := hooks["before_run"].(string); ok {
+				lines = append(lines, "  before_run: |", indentHook(beforeRun))
+			}
+			if afterRun, ok := hooks["after_run"].(string); ok {
+				lines = append(lines, "  after_run: |", indentHook(afterRun))
+			}
 			if beforeRemove, ok := hooks["before_remove"].(string); ok {
 				lines = append(lines, "  before_remove: |", indentHook(beforeRemove))
 			}
-			content = strings.Join(lines, "\n") + "\n---\n"
 		}
+		if workerConfig, ok := overrides["worker"].(map[string]any); ok {
+			lines = append(lines, "worker:")
+			if sshHosts, ok := workerConfig["ssh_hosts"].([]string); ok && len(sshHosts) > 0 {
+				lines = append(lines, "  ssh_hosts:")
+				for _, host := range sshHosts {
+					lines = append(lines, "    - \""+host+"\"")
+				}
+			}
+		}
+		content = strings.Join(lines, "\n") + "\n---\n"
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/openai/symphony/go/internal/pathsafety"
 	"github.com/openai/symphony/go/internal/runtimeconfig"
 	"github.com/openai/symphony/go/internal/workflow"
 )
@@ -84,35 +85,44 @@ type Hooks struct {
 	TimeoutMS    int
 }
 
+// CodexRuntimeSettings is the turn-time Codex session configuration resolved for a concrete workspace.
+type CodexRuntimeSettings struct {
+	ApprovalPolicy    any
+	ThreadSandbox     string
+	TurnSandboxPolicy map[string]any
+}
+
 // Effective is the typed workflow-backed runtime configuration view.
 type Effective struct {
-	TrackerKind                   string
-	LinearEndpoint                string
-	LinearAPIToken                string
-	LinearProjectSlug             string
-	LinearAssignee                string
-	LinearActiveStates            []string
-	LinearTerminalStates          []string
-	PollIntervalMS                int
-	WorkspaceRoot                 string
-	Hooks                         Hooks
-	MaxConcurrentAgents           int
-	MaxRetryBackoffMS             int
-	AgentMaxTurns                 int
-	MaxConcurrentAgentsByState    map[string]int
-	CodexCommand                  string
-	CodexTurnTimeoutMS            int
-	CodexApprovalPolicy           any
-	CodexThreadSandbox            string
-	CodexTurnSandboxPolicy        map[string]any
-	CodexReadTimeoutMS            int
-	CodexStallTimeoutMS           int
-	WorkflowPrompt                string
-	ObservabilityEnabled          bool
-	ObservabilityRefreshMS        int
-	ObservabilityRenderIntervalMS int
-	ServerPort                    *int
-	ServerHost                    string
+	TrackerKind                      string
+	LinearEndpoint                   string
+	LinearAPIToken                   string
+	LinearProjectSlug                string
+	LinearAssignee                   string
+	LinearActiveStates               []string
+	LinearTerminalStates             []string
+	PollIntervalMS                   int
+	WorkspaceRoot                    string
+	WorkerSSHHosts                   []string
+	WorkerMaxConcurrentAgentsPerHost *int
+	Hooks                            Hooks
+	MaxConcurrentAgents              int
+	MaxRetryBackoffMS                int
+	AgentMaxTurns                    int
+	MaxConcurrentAgentsByState       map[string]int
+	CodexCommand                     string
+	CodexTurnTimeoutMS               int
+	CodexApprovalPolicy              any
+	CodexThreadSandbox               string
+	CodexTurnSandboxPolicy           map[string]any
+	CodexReadTimeoutMS               int
+	CodexStallTimeoutMS              int
+	WorkflowPrompt                   string
+	ObservabilityEnabled             bool
+	ObservabilityRefreshMS           int
+	ObservabilityRenderIntervalMS    int
+	ServerPort                       *int
+	ServerHost                       string
 }
 
 // MaxConcurrentAgentsForState returns the state-specific concurrency override when present.
@@ -178,6 +188,15 @@ func Validate() error {
 	if err := validateCodexTurnSandboxPolicy(rawNestedValue(cfg, "codex", "turn_sandbox_policy")); err != nil {
 		return err
 	}
+	if err := validateStringList(rawNestedValue(cfg, "tracker", "active_states"), "tracker.active_states"); err != nil {
+		return err
+	}
+	if err := validateStringList(rawNestedValue(cfg, "tracker", "terminal_states"), "tracker.terminal_states"); err != nil {
+		return err
+	}
+	if err := validatePositiveOptionalInt(rawNestedValue(cfg, "worker", "max_concurrent_agents_per_host"), "worker.max_concurrent_agents_per_host"); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -190,32 +209,34 @@ func effectiveFromLoaded(loaded workflow.Loaded) Effective {
 	cfg := normalizeMap(loaded.Config)
 
 	effective := Effective{
-		TrackerKind:                   normalizeTrackerKind(scalarString(rawNestedValue(cfg, "tracker", "kind"))),
-		LinearEndpoint:                firstNonEmptyString(scalarString(rawNestedValue(cfg, "tracker", "endpoint")), defaultLinearEndpoint),
-		LinearAPIToken:                resolveSecret(rawNestedValue(cfg, "tracker", "api_key"), "LINEAR_API_KEY"),
-		LinearProjectSlug:             normalizeSecretValue(scalarString(rawNestedValue(cfg, "tracker", "project_slug"))),
-		LinearAssignee:                resolveSecret(rawNestedValue(cfg, "tracker", "assignee"), "LINEAR_ASSIGNEE"),
-		LinearActiveStates:            valueOrDefaultStringSlice(csvValue(rawNestedValue(cfg, "tracker", "active_states")), defaultActiveStates),
-		LinearTerminalStates:          valueOrDefaultStringSlice(csvValue(rawNestedValue(cfg, "tracker", "terminal_states")), defaultTerminalStates),
-		PollIntervalMS:                positiveIntOrDefault(rawNestedValue(cfg, "polling", "interval_ms"), defaultPollIntervalMS),
-		WorkspaceRoot:                 resolvePathValue(rawNestedValue(cfg, "workspace", "root"), defaultWorkspaceRoot),
-		Hooks:                         hooksFromConfig(cfg),
-		MaxConcurrentAgents:           positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_concurrent_agents"), defaultMaxConcurrentAgents),
-		MaxRetryBackoffMS:             positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_retry_backoff_ms"), defaultMaxRetryBackoffMS),
-		AgentMaxTurns:                 positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_turns"), defaultAgentMaxTurns),
-		MaxConcurrentAgentsByState:    stateLimits(rawNestedValue(cfg, "agent", "max_concurrent_agents_by_state")),
-		CodexCommand:                  commandOrDefault(rawNestedValue(cfg, "codex", "command"), defaultCodexCommand),
-		CodexTurnTimeoutMS:            intOrDefault(rawNestedValue(cfg, "codex", "turn_timeout_ms"), defaultCodexTurnTimeoutMS),
-		CodexApprovalPolicy:           codexApprovalPolicy(rawNestedValue(cfg, "codex", "approval_policy")),
-		CodexThreadSandbox:            codexThreadSandbox(rawNestedValue(cfg, "codex", "thread_sandbox")),
-		CodexReadTimeoutMS:            intOrDefault(rawNestedValue(cfg, "codex", "read_timeout_ms"), defaultCodexReadTimeoutMS),
-		CodexStallTimeoutMS:           nonNegativeIntOrDefault(rawNestedValue(cfg, "codex", "stall_timeout_ms"), defaultCodexStallTimeoutMS),
-		WorkflowPrompt:                workflowPrompt(loaded.PromptTemplate),
-		ObservabilityEnabled:          boolOrDefault(rawNestedValue(cfg, "observability", "dashboard_enabled"), defaultObservabilityEnabled),
-		ObservabilityRefreshMS:        intOrDefault(rawNestedValue(cfg, "observability", "refresh_ms"), defaultObservabilityRefreshMS),
-		ObservabilityRenderIntervalMS: intOrDefault(rawNestedValue(cfg, "observability", "render_interval_ms"), defaultObservabilityRenderMS),
-		ServerPort:                    serverPortValue(rawNestedValue(cfg, "server", "port")),
-		ServerHost:                    serverHost(rawNestedValue(cfg, "server", "host")),
+		TrackerKind:                      normalizeTrackerKind(scalarString(rawNestedValue(cfg, "tracker", "kind"))),
+		LinearEndpoint:                   firstNonEmptyString(scalarString(rawNestedValue(cfg, "tracker", "endpoint")), defaultLinearEndpoint),
+		LinearAPIToken:                   resolveSecret(rawNestedValue(cfg, "tracker", "api_key"), "LINEAR_API_KEY"),
+		LinearProjectSlug:                normalizeSecretValue(scalarString(rawNestedValue(cfg, "tracker", "project_slug"))),
+		LinearAssignee:                   resolveSecret(rawNestedValue(cfg, "tracker", "assignee"), "LINEAR_ASSIGNEE"),
+		LinearActiveStates:               valueOrDefaultStringSlice(csvValue(rawNestedValue(cfg, "tracker", "active_states")), defaultActiveStates),
+		LinearTerminalStates:             valueOrDefaultStringSlice(csvValue(rawNestedValue(cfg, "tracker", "terminal_states")), defaultTerminalStates),
+		PollIntervalMS:                   positiveIntOrDefault(rawNestedValue(cfg, "polling", "interval_ms"), defaultPollIntervalMS),
+		WorkspaceRoot:                    resolvePathValue(rawNestedValue(cfg, "workspace", "root"), defaultWorkspaceRoot),
+		WorkerSSHHosts:                   workerSSHHosts(rawNestedValue(cfg, "worker", "ssh_hosts")),
+		WorkerMaxConcurrentAgentsPerHost: optionalPositiveInt(rawNestedValue(cfg, "worker", "max_concurrent_agents_per_host")),
+		Hooks:                            hooksFromConfig(cfg),
+		MaxConcurrentAgents:              positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_concurrent_agents"), defaultMaxConcurrentAgents),
+		MaxRetryBackoffMS:                positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_retry_backoff_ms"), defaultMaxRetryBackoffMS),
+		AgentMaxTurns:                    positiveIntOrDefault(rawNestedValue(cfg, "agent", "max_turns"), defaultAgentMaxTurns),
+		MaxConcurrentAgentsByState:       stateLimits(rawNestedValue(cfg, "agent", "max_concurrent_agents_by_state")),
+		CodexCommand:                     commandOrDefault(rawNestedValue(cfg, "codex", "command"), defaultCodexCommand),
+		CodexTurnTimeoutMS:               intOrDefault(rawNestedValue(cfg, "codex", "turn_timeout_ms"), defaultCodexTurnTimeoutMS),
+		CodexApprovalPolicy:              codexApprovalPolicy(rawNestedValue(cfg, "codex", "approval_policy")),
+		CodexThreadSandbox:               codexThreadSandbox(rawNestedValue(cfg, "codex", "thread_sandbox")),
+		CodexReadTimeoutMS:               intOrDefault(rawNestedValue(cfg, "codex", "read_timeout_ms"), defaultCodexReadTimeoutMS),
+		CodexStallTimeoutMS:              nonNegativeIntOrDefault(rawNestedValue(cfg, "codex", "stall_timeout_ms"), defaultCodexStallTimeoutMS),
+		WorkflowPrompt:                   workflowPrompt(loaded.PromptTemplate),
+		ObservabilityEnabled:             boolOrDefault(rawNestedValue(cfg, "observability", "dashboard_enabled"), defaultObservabilityEnabled),
+		ObservabilityRefreshMS:           intOrDefault(rawNestedValue(cfg, "observability", "refresh_ms"), defaultObservabilityRefreshMS),
+		ObservabilityRenderIntervalMS:    intOrDefault(rawNestedValue(cfg, "observability", "render_interval_ms"), defaultObservabilityRenderMS),
+		ServerPort:                       serverPortValue(rawNestedValue(cfg, "server", "port")),
+		ServerHost:                       serverHost(rawNestedValue(cfg, "server", "host")),
 	}
 
 	if overridePort, ok := runtimeconfig.ServerPortOverride(); ok {
@@ -225,6 +246,26 @@ func effectiveFromLoaded(loaded workflow.Loaded) Effective {
 	effective.CodexTurnSandboxPolicy = codexTurnSandboxPolicy(rawNestedValue(cfg, "codex", "turn_sandbox_policy"), effective.WorkspaceRoot)
 
 	return effective
+}
+
+// RuntimeCodexSettings resolves the current Codex runtime settings for one workspace path.
+func RuntimeCodexSettings(workspace string, remote bool) (CodexRuntimeSettings, error) {
+	current := Current()
+	policy, err := resolveRuntimeTurnSandboxPolicy(current, workspace, remote)
+	if err != nil {
+		return CodexRuntimeSettings{}, err
+	}
+
+	return CodexRuntimeSettings{
+		ApprovalPolicy:    current.CodexApprovalPolicy,
+		ThreadSandbox:     current.CodexThreadSandbox,
+		TurnSandboxPolicy: policy,
+	}, nil
+}
+
+// LocalWorkspaceRoot returns the current workspace root expanded for local filesystem use.
+func LocalWorkspaceRoot() string {
+	return expandedLocalWorkspaceRoot(Current().WorkspaceRoot)
 }
 
 func hooksFromConfig(cfg map[string]any) Hooks {
@@ -238,13 +279,10 @@ func hooksFromConfig(cfg map[string]any) Hooks {
 }
 
 func validateCodexApprovalPolicy(value any) error {
-	switch typed := normalizeAny(value).(type) {
+	switch normalizeAny(value).(type) {
 	case nil:
 		return nil
 	case string:
-		if strings.TrimSpace(typed) == "" {
-			return &InvalidCodexApprovalPolicyError{Value: value}
-		}
 		return nil
 	case map[string]any:
 		return nil
@@ -254,13 +292,10 @@ func validateCodexApprovalPolicy(value any) error {
 }
 
 func validateCodexThreadSandbox(value any) error {
-	switch typed := normalizeAny(value).(type) {
+	switch normalizeAny(value).(type) {
 	case nil:
 		return nil
 	case string:
-		if strings.TrimSpace(typed) == "" {
-			return &InvalidCodexThreadSandboxError{Value: value}
-		}
 		return nil
 	default:
 		return &InvalidCodexThreadSandboxError{Value: value}
@@ -303,9 +338,6 @@ func codexApprovalPolicy(value any) any {
 	case nil:
 		return cloneAny(defaultCodexApprovalPolicy)
 	case string:
-		if strings.TrimSpace(typed) == "" {
-			return cloneAny(defaultCodexApprovalPolicy)
-		}
 		return strings.TrimSpace(typed)
 	case map[string]any:
 		return cloneAny(typed)
@@ -315,20 +347,18 @@ func codexApprovalPolicy(value any) any {
 }
 
 func codexThreadSandbox(value any) string {
-	raw := scalarString(value)
-	if strings.TrimSpace(raw) == "" {
+	if value == nil {
 		return defaultCodexThreadSandbox
 	}
 
-	return strings.TrimSpace(raw)
+	return strings.TrimSpace(scalarString(value))
 }
 
-func codexTurnSandboxPolicy(value any, workspaceRoot string) map[string]any {
+func codexTurnSandboxPolicy(value any, _ string) map[string]any {
 	if normalized, ok := normalizeAny(value).(map[string]any); ok {
 		return cloneAny(normalized).(map[string]any)
 	}
-
-	return defaultTurnSandboxPolicy(workspaceRoot)
+	return nil
 }
 
 func defaultTurnSandboxPolicy(workspaceRoot string) map[string]any {
@@ -384,6 +414,15 @@ func stateLimits(value any) map[string]int {
 	return result
 }
 
+func optionalPositiveInt(value any) *int {
+	parsed, ok := parsePositiveInt(value)
+	if !ok {
+		return nil
+	}
+
+	return intPointer(parsed)
+}
+
 func resolveSecret(value any, fallbackEnv string) string {
 	raw := scalarString(value)
 	fallback := normalizeSecretValue(os.Getenv(fallbackEnv))
@@ -423,24 +462,7 @@ func resolvePathValue(value any, fallback string) string {
 	}
 
 	if strings.HasPrefix(raw, "~") {
-		if home, err := os.UserHomeDir(); err == nil {
-			switch {
-			case raw == "~":
-				raw = home
-			case strings.HasPrefix(raw, "~/"):
-				raw = filepath.Join(home, strings.TrimPrefix(raw, "~/"))
-			}
-		}
-	}
-
-	if isURI(raw) {
 		return raw
-	}
-
-	if strings.Contains(raw, "/") || strings.Contains(raw, string(os.PathSeparator)) || strings.Contains(raw, "\\") {
-		if expanded, err := filepath.Abs(raw); err == nil {
-			return expanded
-		}
 	}
 
 	return raw
@@ -548,31 +570,55 @@ func normalizeTrackerKind(value string) string {
 }
 
 func normalizeIssueState(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
+	return strings.ToLower(value)
 }
 
 func csvValue(value any) []string {
-	switch typed := normalizeAny(value).(type) {
+	switch typed := value.(type) {
 	case []any:
 		var values []string
 		for _, raw := range typed {
-			if normalized := scalarString(raw); normalized != "" {
-				values = append(values, normalized)
+			switch entry := raw.(type) {
+			case string:
+				values = append(values, entry)
+			case fmt.Stringer:
+				values = append(values, entry.String())
+			case nil:
+			default:
+				values = append(values, fmt.Sprint(entry))
 			}
 		}
 		return values
-	case string:
-		if strings.TrimSpace(typed) == "" {
-			return nil
-		}
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return nil
+	}
+}
 
-		var values []string
-		for _, part := range strings.Split(typed, ",") {
-			if normalized := strings.TrimSpace(part); normalized != "" {
-				values = append(values, normalized)
+func workerSSHHosts(value any) []string {
+	switch typed := value.(type) {
+	case []any:
+		hosts := make([]string, 0, len(typed))
+		seen := map[string]struct{}{}
+		for _, raw := range typed {
+			host, ok := raw.(string)
+			if !ok {
+				continue
 			}
+			trimmed := strings.TrimSpace(host)
+			if trimmed == "" {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			hosts = append(hosts, trimmed)
 		}
-		return values
+		return hosts
+	case []string:
+		return workerSSHHosts(anySlice(typed))
 	default:
 		return nil
 	}
@@ -694,4 +740,87 @@ func intPointer(value int) *int {
 
 func isURI(value string) bool {
 	return strings.Contains(value, "://")
+}
+
+func resolveRuntimeTurnSandboxPolicy(current Effective, workspace string, remote bool) (map[string]any, error) {
+	if current.CodexTurnSandboxPolicy != nil {
+		return cloneAny(current.CodexTurnSandboxPolicy).(map[string]any), nil
+	}
+
+	if remote {
+		root := current.WorkspaceRoot
+		if strings.TrimSpace(workspace) != "" {
+			root = workspace
+		}
+		if strings.TrimSpace(root) == "" {
+			root = defaultWorkspaceRoot
+		}
+		return defaultTurnSandboxPolicy(root), nil
+	}
+
+	root := current.WorkspaceRoot
+	if strings.TrimSpace(workspace) != "" {
+		root = workspace
+	}
+	return defaultTurnSandboxPolicy(expandedLocalWorkspaceRoot(root)), nil
+}
+
+func expandedLocalWorkspaceRoot(root string) string {
+	if strings.TrimSpace(root) == "" {
+		root = defaultWorkspaceRoot
+	}
+
+	if strings.HasPrefix(root, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			switch {
+			case root == "~":
+				root = home
+			case strings.HasPrefix(root, "~/"):
+				root = filepath.Join(home, strings.TrimPrefix(root, "~/"))
+			}
+		}
+	}
+
+	if !isURI(root) && (strings.Contains(root, "/") || strings.Contains(root, string(os.PathSeparator)) || strings.Contains(root, "\\")) {
+		if expanded, err := filepath.Abs(root); err == nil {
+			root = expanded
+		}
+	}
+
+	if canonical, err := pathsafety.Canonicalize(root); err == nil {
+		return canonical
+	}
+
+	return root
+}
+
+func validateStringList(value any, field string) error {
+	if value == nil {
+		return nil
+	}
+
+	switch value.(type) {
+	case []any, []string:
+		return nil
+	default:
+		return fmt.Errorf("%s must be a YAML list of strings", field)
+	}
+}
+
+func validatePositiveOptionalInt(value any, field string) error {
+	if value == nil {
+		return nil
+	}
+	if _, ok := parsePositiveInt(value); ok {
+		return nil
+	}
+	return fmt.Errorf("%s must be a positive integer", field)
+}
+
+func anySlice(values []string) []any {
+	result := make([]any, len(values))
+	for index, value := range values {
+		result[index] = value
+	}
+	return result
 }
