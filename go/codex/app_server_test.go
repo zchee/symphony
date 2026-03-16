@@ -1,12 +1,15 @@
 package codex
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/openai/symphony/go/config"
@@ -771,7 +774,7 @@ done
 	}
 }
 
-func TestRunCapturesNonJSONStderrAsMalformedEvent(t *testing.T) {
+func TestRunLogsNonJSONStderrWithoutMalformedEvent(t *testing.T) {
 	testRoot := t.TempDir()
 	workspaceRoot := filepath.Join(testRoot, "workspaces")
 	workspace := filepath.Join(workspaceRoot, "MT-92")
@@ -803,6 +806,7 @@ done
 	})
 
 	issue := domain.Issue{ID: "issue-stderr", Identifier: "MT-92", Title: "Capture stderr"}
+	logs := captureAppServerLogs(t)
 	var events []map[string]any
 	_, err := Run(workspace, "Capture stderr line", issue, RunOptions{
 		OnMessage: func(message map[string]any) {
@@ -812,12 +816,21 @@ done
 	if err != nil {
 		t.Fatalf("Run() returned error: %v", err)
 	}
+	var sawTurnCompleted bool
 	for _, event := range events {
+		if event["event"] == "turn_completed" {
+			sawTurnCompleted = true
+		}
 		if event["event"] == "malformed" && event["stream"] == "stderr" && event["raw"] == "warning: this is stderr noise" {
-			return
+			t.Fatalf("events = %#v, stderr noise must not emit malformed", events)
 		}
 	}
-	t.Fatalf("events = %#v, want malformed stderr event", events)
+	if !sawTurnCompleted {
+		t.Fatalf("events = %#v, want turn_completed event", events)
+	}
+	if !strings.Contains(logs.String(), "Codex turn stream output: warning: this is stderr noise") {
+		t.Fatalf("logs = %q, want stderr noise log line", logs.String())
+	}
 }
 
 func TestRunLaunchesOverSSHForRemoteWorkers(t *testing.T) {
@@ -1067,4 +1080,25 @@ func nestedMapInt(t *testing.T, root map[string]any, path ...string) int {
 		t.Fatalf("unexpected int value type %T at path %#v", current, path)
 		return 0
 	}
+}
+
+var appServerLogCaptureMu sync.Mutex
+
+func captureAppServerLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	appServerLogCaptureMu.Lock()
+	var buf bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+		appServerLogCaptureMu.Unlock()
+	})
+	return &buf
 }

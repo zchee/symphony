@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/openai/symphony/go/config"
 	"github.com/openai/symphony/go/domain"
@@ -944,6 +945,9 @@ func (s *Session) emitTurnEndedWithError(issue domain.Issue, sessionID string, r
 
 func (s *Session) emitStreamMessage(message incomingMessage, onMessage MessageHandler) {
 	if !message.isJSON || message.payload == nil {
+		if !protocolMessageCandidate(message.raw) {
+			return
+		}
 		emitMessage(onMessage, map[string]any{
 			"event":                "malformed",
 			"payload":              message.raw,
@@ -979,6 +983,9 @@ func (s *Session) drainResidualMessages(onMessage MessageHandler) {
 	for {
 		select {
 		case message := <-s.messages:
+			if !message.isJSON || message.payload == nil {
+				logNonJSONStreamLine(message.raw, "turn stream")
+			}
 			s.emitStreamMessage(message, onMessage)
 			if !timer.Stop() {
 				select {
@@ -991,6 +998,10 @@ func (s *Session) drainResidualMessages(onMessage MessageHandler) {
 			return
 		}
 	}
+}
+
+func protocolMessageCandidate(data string) bool {
+	return strings.HasPrefix(strings.TrimLeftFunc(data, unicode.IsSpace), "{")
 }
 
 func readStreamLines(reader io.Reader, stream string, messages chan<- incomingMessage) {
