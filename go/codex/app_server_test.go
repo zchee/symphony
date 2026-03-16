@@ -833,6 +833,63 @@ done
 	}
 }
 
+func TestRunEmitsMalformedEventForJSONLikeProtocolLine(t *testing.T) {
+	testRoot := t.TempDir()
+	workspaceRoot := filepath.Join(testRoot, "workspaces")
+	workspace := filepath.Join(workspaceRoot, "MT-93")
+	codexBinary := filepath.Join(testRoot, "fake-codex")
+	mustMkdirAll(t, workspace)
+
+	writeExecutable(t, codexBinary, `#!/bin/sh
+count=0
+while IFS= read -r _line; do
+  count=$((count + 1))
+  case "$count" in
+    1) printf '%s\n' '{"id":1,"result":{}}' ;;
+    2) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}' ;;
+    3) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}' ;;
+    4)
+      printf '%s\n' '{"method":"turn/completed"'
+      printf '%s\n' '{"method":"turn/completed"}'
+      exit 0
+      ;;
+    *) exit 0 ;;
+  esac
+done
+`)
+
+	writeCodexWorkflow(t, workspaceRoot, map[string]any{
+		"codex": map[string]any{
+			"command": codexBinary + " app-server",
+		},
+	})
+
+	issue := domain.Issue{ID: "issue-malformed-protocol", Identifier: "MT-93", Title: "Malformed protocol"}
+	var events []map[string]any
+	_, err := Run(workspace, "Capture malformed protocol line", issue, RunOptions{
+		OnMessage: func(message map[string]any) {
+			events = append(events, message)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() returned error: %v", err)
+	}
+
+	var sawMalformed bool
+	var sawTurnCompleted bool
+	for _, event := range events {
+		if event["event"] == "malformed" && event["raw"] == `{"method":"turn/completed"` {
+			sawMalformed = true
+		}
+		if event["event"] == "turn_completed" {
+			sawTurnCompleted = true
+		}
+	}
+	if !sawMalformed || !sawTurnCompleted {
+		t.Fatalf("events = %#v, want malformed JSON-like frame and turn_completed", events)
+	}
+}
+
 func TestRunLaunchesOverSSHForRemoteWorkers(t *testing.T) {
 	testRoot := t.TempDir()
 	traceFile := filepath.Join(testRoot, "ssh.trace")
