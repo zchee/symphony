@@ -35,29 +35,15 @@ type Options struct {
 
 // Run executes one issue in a workspace until completion, inactivity, or max turns.
 func Run(issue domain.Issue, opts Options) error {
-	workerHosts := candidateWorkerHosts(opts.WorkerHost, config.Current().WorkerSSHHosts)
-	log.Printf("Starting agent run for %s worker_hosts=%v", issueContext(issue), workerHostsForLog(workerHosts))
+	workerHost := selectedWorkerHost(opts.WorkerHost, config.Current().WorkerSSHHosts)
+	log.Printf("Starting agent run for %s worker_host=%s", issueContext(issue), workerHostForLog(workerHost))
 
-	var lastErr error
-	for index, workerHost := range workerHosts {
-		log.Printf("Starting worker attempt for %s worker_host=%s", issueContext(issue), workerHostForLog(workerHost))
-		if err := runOnWorkerHost(issue, opts, workerHost); err != nil {
-			lastErr = err
-			if index < len(workerHosts)-1 {
-				log.Printf("Agent run failed for %s worker_host=%s reason=%v; trying next worker host", issueContext(issue), workerHostForLog(workerHost), err)
-				continue
-			}
-			logAgentFailure(issue, err)
-			return fmt.Errorf("agent run failed for %s: %w", issueContext(issue), err)
-		}
-		return nil
+	if err := runOnWorkerHost(issue, opts, workerHost); err != nil {
+		logAgentFailure(issue, err)
+		return fmt.Errorf("agent run failed for %s: %w", issueContext(issue), err)
 	}
 
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no_worker_hosts_available")
-	}
-	logAgentFailure(issue, lastErr)
-	return fmt.Errorf("agent run failed for %s: %w", issueContext(issue), lastErr)
+	return nil
 }
 
 func runOnWorkerHost(issue domain.Issue, opts Options, workerHost string) error {
@@ -211,44 +197,19 @@ func runAfterRunHook(workspacePath, workerHost string) {
 	workspace.RunAfterRunHookOnHost(workspacePath, workerHost)
 }
 
-func candidateWorkerHosts(preferredHost string, configuredHosts []string) []string {
+func selectedWorkerHost(preferredHost string, configuredHosts []string) string {
 	trimmedPreferred := strings.TrimSpace(preferredHost)
-	if len(configuredHosts) == 0 {
-		if trimmedPreferred == "" {
-			return []string{""}
-		}
-		return []string{trimmedPreferred}
+	if trimmedPreferred != "" {
+		return trimmedPreferred
 	}
 
-	hosts := make([]string, 0, len(configuredHosts)+1)
-	seen := map[string]struct{}{}
-	if trimmedPreferred != "" {
-		hosts = append(hosts, trimmedPreferred)
-		seen[trimmedPreferred] = struct{}{}
-	}
 	for _, host := range configuredHosts {
 		trimmed := strings.TrimSpace(host)
-		if trimmed == "" {
-			continue
+		if trimmed != "" {
+			return trimmed
 		}
-		if _, ok := seen[trimmed]; ok {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		hosts = append(hosts, trimmed)
 	}
-	if len(hosts) == 0 {
-		return []string{""}
-	}
-	return hosts
-}
-
-func workerHostsForLog(workerHosts []string) []string {
-	result := make([]string, len(workerHosts))
-	for index, workerHost := range workerHosts {
-		result[index] = workerHostForLog(workerHost)
-	}
-	return result
+	return ""
 }
 
 func workerHostForLog(workerHost string) string {

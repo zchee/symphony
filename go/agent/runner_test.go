@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/openai/symphony/go/domain"
 	"github.com/openai/symphony/go/runtimeconfig"
+	"github.com/openai/symphony/go/workspace"
 )
 
 func TestRunEmitsSessionStartedUpdate(t *testing.T) {
@@ -249,6 +251,100 @@ done
 	}
 }
 
+func TestSelectedWorkerHostPrefersExplicitHostThenFirstConfiguredHost(t *testing.T) {
+	testCases := []struct {
+		name       string
+		preferred  string
+		configured []string
+		want       string
+	}{
+		{
+			name: "local when no host is configured",
+			want: "",
+		},
+		{
+			name:       "preferred host wins",
+			preferred:  "worker-b",
+			configured: []string{"worker-a", "worker-c"},
+			want:       "worker-b",
+		},
+		{
+			name:       "first configured non-empty host is selected",
+			configured: []string{"", " worker-a ", "worker-b"},
+			want:       "worker-a",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := selectedWorkerHost(testCase.preferred, testCase.configured); got != testCase.want {
+				t.Fatalf("selectedWorkerHost(%q, %#v) = %q, want %q", testCase.preferred, testCase.configured, got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestRunSurfacesSSHStartupFailuresWithoutFailingOverHosts(t *testing.T) {
+	testRoot := t.TempDir()
+	traceFile := filepath.Join(testRoot, "ssh.trace")
+	fakeSSH := filepath.Join(testRoot, "ssh")
+	t.Setenv("PATH", testRoot+":"+os.Getenv("PATH"))
+	t.Setenv("SYMP_TEST_SSH_TRACE", traceFile)
+
+	writeExecutable(t, fakeSSH, `#!/bin/sh
+trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+printf 'ARGV:%s\n' "$*" >> "$trace_file"
+
+case "$*" in
+  *worker-a*"__SYMPHONY_WORKSPACE__"*)
+    printf '%s\n' 'worker-a prepare failed' >&2
+    exit 75
+    ;;
+  *worker-b*"__SYMPHONY_WORKSPACE__"*)
+    printf '%s\t%s\t%s\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`)
+
+	writeAgentWorkflow(t, "~/.symphony-remote-workspaces", map[string]any{
+		"worker": map[string]any{
+			"ssh_hosts": []string{"worker-a", "worker-b"},
+		},
+	})
+
+	issue := domain.Issue{
+		ID:         "issue-ssh-failover",
+		Identifier: "MT-SSH-FAILOVER",
+		Title:      "Do not fail over within one worker run",
+		State:      "In Progress",
+	}
+
+	err := Run(issue, Options{WorkerHost: "worker-a"})
+	if err == nil {
+		t.Fatal("Run() error = nil, want remote startup failure")
+	}
+
+	var hookErr *workspace.WorkspaceHookFailedError
+	if !errors.As(err, &hookErr) {
+		t.Fatalf("Run() error = %v, want WorkspaceHookFailedError", err)
+	}
+	if hookErr.Hook != "remote_prepare" || hookErr.Status != 75 {
+		t.Fatalf("workspace hook error = %#v, want remote_prepare status 75", hookErr)
+	}
+
+	trace := string(mustReadFile(t, traceFile))
+	if !strings.Contains(trace, "worker-a bash -lc") {
+		t.Fatalf("trace missing worker-a prepare command: %q", trace)
+	}
+	if strings.Contains(trace, "worker-b bash -lc") {
+		t.Fatalf("trace unexpectedly retried worker-b: %q", trace)
+	}
+}
+
 func TestRunLogsFailure(t *testing.T) {
 	testRoot := t.TempDir()
 	workspaceRoot := filepath.Join(testRoot, "workspaces")
@@ -332,6 +428,22 @@ func writeAgentWorkflow(t *testing.T, workspaceRoot string, overrides map[string
 		lines = append(lines, "agent:")
 		if maxTurns, ok := agentConfig["max_turns"]; ok {
 			lines = append(lines, fmt.Sprintf("  max_turns: %v", maxTurns))
+		}
+	}
+
+	if workerConfig, ok := overrides["worker"].(map[string]any); ok {
+		lines = append(lines, "worker:")
+		switch sshHosts := workerConfig["ssh_hosts"].(type) {
+		case []string:
+			lines = append(lines, "  ssh_hosts:")
+			for _, host := range sshHosts {
+				lines = append(lines, `    - "`+strings.ReplaceAll(host, `"`, `\"`)+`"`)
+			}
+		case []any:
+			lines = append(lines, "  ssh_hosts:")
+			for _, host := range sshHosts {
+				lines = append(lines, fmt.Sprintf(`    - "%v"`, host))
+			}
 		}
 	}
 
